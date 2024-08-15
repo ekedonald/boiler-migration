@@ -1,0 +1,161 @@
+name: Build, Test, and Deploy for Production
+
+on: workflow_dispatch
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      TEST_USERNAME: postgres
+      TEST_PASSWORD: password
+      TEST_DB_NAME: db_name
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: 5432
+      TEST_DB_CONNECTION: pgsql
+      TEST_TIMEZONE: Africa/Lagos
+      TEST_SSLMODE: disable
+      TEST_MIGRATE: true
+      REDIS_PORT: 6379
+      REDIS_HOST: localhost
+      REDIS_DB: 0
+
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_USER: ${{ env.TEST_USERNAME }}
+          POSTGRES_PASSWORD: ${{ env.TEST_PASSWORD }}
+          POSTGRES_DB: ${{ env.TEST_DB_NAME }}
+        ports:
+          - 5432:5432
+      redis:
+        image: redis
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Set Golang
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.22.1"
+      - name: Create app config file
+        run: cp app-sample.env app.env
+      - name: Build the application
+        run: go build -o production_app
+      - name: Run the application
+        run: nohup ./production_app > /dev/null 2>&1 &
+      - name: Wait for application to start
+        run: |
+          for i in {1..30}; do
+            curl -s http://localhost:8019 && break
+            sleep 1
+          done
+      - name: Run All Tests
+        run: go test ./... -timeout 300s
+
+  update_repo_with_env:
+    runs-on: ubuntu-latest
+    needs: build_and_test
+    if: github.event.repository.fork == false
+    environment: production
+    env:
+      SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Create app.env file
+        uses: vicradon/create-env-action@v1.0.1
+        with:
+          action_input_file: "app-sample.env"
+          action_output_file: "app.env"
+          action_true_string_variables: |
+            SERVER_PORT
+          SERVER_PORT: ${{ secrets.SERVER_PORT }} 
+          DB_NAME: ${{ secrets.DB_NAME }} 
+          USERNAME: ${{ secrets.DB_USER }} 
+          APP_NAME: "production"
+          APP_URL: "https://api-golang.boilerplate.hng.tech"
+          REDIS_PORT: 6132
+          REDIS_DB: "0"
+          MIGRATE: "true"
+
+      - name: copy app.env to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          source: "app.env"
+          target: ~/deployments/production
+
+  build_and_transfer_artifact:
+    runs-on: ubuntu-latest
+    needs: update_repo_with_env
+    if: github.event.repository.fork == false
+    environment: production
+    env:
+      SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.22.1"
+      - name: Build Go application
+        run: go build -o production_app
+      - name: Zip the artifact
+        run: tar -cvzf production_app.tar.gz production_app
+      - name: Transfer artifact to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USERNAME }}
+          password: ${{ env.SSH_PASSWORD }}
+          port: ${{ env.SSH_PORT }}
+          source: "production_app.tar.gz"
+          target: "~/deployments/production"
+        
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build_and_transfer_artifact
+    if: github.event_name == 'push'
+    environment: production
+    env:
+      SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+
+    steps:
+      - name: SSH into server and deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          script: |
+            mkdir -p ~/deployments/production
+            cd ~/deployments/production
+            tar -xvzf production_app.tar.gz
+            rm production_app.tar.gz 
+            git reset --hard
+            git pull origin main
+            pm2 restart production_app

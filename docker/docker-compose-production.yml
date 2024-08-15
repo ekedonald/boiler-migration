@@ -1,0 +1,38 @@
+name: golang_prod
+
+services:
+  db:
+    image: postgres:16
+    env_file:
+      - app.env
+    volumes:
+      - ../pgsql_volumes/golang_prod/:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U production_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 2
+
+  redis:
+    image: redis:latest
+
+  backend:
+    image: golang_prod:latest
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - app.env
+
+  nginx:
+    image: nginx:latest
+    depends_on:
+      - backend
+    ports:
+      - "7002:80"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf
